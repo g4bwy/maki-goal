@@ -1,6 +1,10 @@
 local Store = require("goal_store")
 local Policy = require("goal_policy")
 local UI = require("goal_ui")
+local Tasks = require("goal_tasks")
+local Contracts = require("goal_contracts")
+local Settings = require("goal_settings")
+local Auditor = require("goal_auditor")
 local ListPicker = require("maki.list_picker")
 
 local pool = {}
@@ -76,13 +80,15 @@ local function notify(msg)
   maki.ui.flash(msg)
 end
 
-load_state()
+-- Lazy load: state is loaded on first tool call (async context) via ensure_loaded()
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use **goal_get** to check the current goal state.\n"
     .. "- Use **goal_set** to create a new goal, **goal_update** to manage its lifecycle.\n"
-    .. "- Use **goal_list** to list open goals, **goal_focus** to switch focus.",
+    .. "- Use **goal_list** to list open goals, **goal_focus** to switch focus.\n"
+    .. "- Use **propose_task_list** to create a task breakdown for the focused goal.\n"
+    .. "- Use **complete_task** / **skip_task** to manage task progress.",
 })
 
 maki.api.register_prompt_hint({
@@ -199,6 +205,37 @@ No active goal. Use goal_set to create one, or ask the user what to work on.]]
       lines[#lines + 1] = "- If blocked or unclear: pause, do not invent workarounds."
     end
 
+    -- Verification contract section
+    if Contracts.has_contract(goal) then
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "## Verification Contract"
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "Before marking this goal complete, you must satisfy the following contract:"
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = goal.verification_contract
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "Provide a verification_summary when completing the goal that demonstrates"
+      lines[#lines + 1] = "the contract requirements have been met."
+    end
+
+    -- Task list section
+    if goal.tasks and Tasks.count_tasks(goal.tasks) > 0 then
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "## Task List"
+      lines[#lines + 1] = ""
+      local completed = Tasks.count_complete(goal.tasks)
+      local total = Tasks.count_tasks(goal.tasks)
+      lines[#lines + 1] = string.format("Progress: %d/%d tasks complete", completed, total)
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = Tasks.render_task_tree(goal.tasks)
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "Task protocol:"
+      lines[#lines + 1] = "- Work through tasks in order. Use complete_task to mark each done."
+      lines[#lines + 1] = "- Tasks with (*) have verification contracts: provide evidence when completing."
+      lines[#lines + 1] = "- Use skip_task with a reason to skip tasks that are not applicable."
+      lines[#lines + 1] = "- Subtasks must be completed before their parent task."
+    end
+
     return table.concat(lines, "\n")
   end,
 })
@@ -252,6 +289,23 @@ maki.api.register_tool({
         type = "boolean",
         description = "Auto-continue working until completion. Default: true.",
       },
+      tasks = {
+        type = "array",
+        description = "Optional initial task list. Array of task objects with id, title, and optional subtasks/verification_contract.",
+        items = {
+          type = "object",
+          properties = {
+            id = { type = "string" },
+            title = { type = "string" },
+            verification_contract = { type = "string" },
+            subtasks = { type = "array", items = { type = "object", properties = {} } },
+          },
+        },
+      },
+      skip_auditor = {
+        type = "boolean",
+        description = "Skip the auditor for this goal. Default: false.",
+      },
     },
   },
   audiences = { "main" },
@@ -264,11 +318,38 @@ maki.api.register_tool({
       return "error: objective is required and must be non-empty"
     end
 
+    -- Extract verification contract from objective if present
+    local contract, cleaned_objective = nil, input.objective
+    if Settings.contracts_enabled() then
+      contract, cleaned_objective = Contracts.extract_contract(input.objective)
+    end
+    if cleaned_objective and cleaned_objective ~= "" then
+      input.objective = cleaned_objective
+    end
+
+    -- Normalize tasks if provided
+    local goal_tasks = nil
+    if input.tasks and #input.tasks > 0 then
+      if Settings.tasks_enabled() then
+        goal_tasks = Tasks.normalize_task_list(input.tasks)
+      end
+    end
+
     local goal = Store.create_goal({
       objective = input.objective,
       sisyphus = input.sisyphus,
       auto_continue = input.auto_continue,
     })
+
+    if contract then
+      goal.verification_contract = contract
+    end
+    if goal_tasks then
+      goal.tasks = goal_tasks
+    end
+    if input.skip_auditor then
+      goal.skip_auditor = true
+    end
 
     local ok, err = save_goal(goal)
     if not ok then
@@ -308,6 +389,10 @@ maki.api.register_tool({
         type = "string",
         description = "Required for complete action: what was accomplished.",
       },
+      verification_summary = {
+        type = "string",
+        description = "Required for complete action if goal has a verification contract: evidence the contract is satisfied.",
+      },
       new_objective = {
         type = "string",
         description = "Required for tweak action: the revised objective.",
@@ -328,7 +413,7 @@ maki.api.register_tool({
     local action = input.action
 
     if action == "complete" then
-      local ok, msg = Policy.validate_completion(goal)
+      local ok, msg = Policy.validate_completion_with_contracts(goal, input.verification_summary)
       if not ok then
         return "error: " .. msg
       end
@@ -336,23 +421,36 @@ maki.api.register_tool({
         return "error: completion_summary is required for complete action"
       end
 
-      local updates = Policy.build_completed_goal(goal)
+      -- Check task gate (warning, does not block)
+      local task_warning = Policy.validate_task_gate(goal)
+
+      -- Build completed goal with verification summary
+      local updates = Policy.build_completed_goal(goal, input.verification_summary)
       for k, v in pairs(updates) do
         goal[k] = v
       end
+
+      -- Run auditor if enabled
+      local auditor_result = Auditor.run_audit(goal, input.completion_summary, input.verification_summary)
+      local auditor_approved = auditor_result.approved
+      local auditor_report = auditor_result.report
+
+      -- Use deferred archival instead of immediate archive
+      Auditor.build_deferred_archival_event(goal, input.completion_summary, input.verification_summary, auditor_report)
+      goal._deferred_archive = true
+
       local ok, err = save_goal(goal)
       if not ok then
         return "error: failed to save goal: " .. tostring(err)
       end
-
-      local ok, err = Store.archive_goal(goal)
-      if not ok then
-        return "error: failed to archive goal: " .. tostring(err)
-      end
       set_focus(nil, "completed")
       UI.clear_status_hint()
 
-      return UI.build_completion_report(goal, input.completion_summary, nil)
+      local report = UI.build_completion_report(goal, input.completion_summary, auditor_report)
+      if task_warning then
+        report = report .. "\n\n" .. task_warning
+      end
+      return report
 
     elseif action == "pause" then
       local ok, msg = Policy.validate_pause(goal)
@@ -419,7 +517,8 @@ maki.api.register_tool({
       return "Goal aborted and archived.\nReason: " .. input.reason
 
     elseif action == "tweak" then
-      local ok, msg = Policy.validate_tweak(goal)
+      -- Enforce that tweaks only happen through /goal-tweak flow
+      local ok, msg = Policy.validate_tweak_requires_flow(goal)
       if not ok then
         return "error: " .. msg
       end
@@ -436,12 +535,190 @@ maki.api.register_tool({
         return "error: failed to save goal: " .. tostring(err)
       end
       tweak_state = nil
+      goal.tweak_state = nil
+      save_goal(goal)
 
       return string.format("Goal tweaked.\n%s\n\nNew objective:\n%s", input.change_summary or "Updated.", goal.objective)
 
     else
       return "error: unknown action: " .. tostring(action)
     end
+  end,
+})
+
+maki.api.register_tool({
+  name = "propose_task_list",
+  description = "Propose a structured task list for the focused goal. Shows a confirmation dialog.",
+  schema = {
+    type = "object",
+    required = { "tasks" },
+    properties = {
+      tasks = {
+        type = "array",
+        description = "Array of task objects with id, title, and optional subtasks/verification_contract.",
+        items = {
+          type = "object",
+          properties = {
+            id = { type = "string" },
+            title = { type = "string" },
+            verification_contract = { type = "string" },
+            subtasks = { type = "array", items = { type = "object", properties = {} } },
+          },
+        },
+      },
+    },
+  },
+  audiences = { "main" },
+  header = function(input)
+    return "propose task list (" .. tostring(#input.tasks) .. " tasks)"
+  end,
+  handler = function(input)
+    refresh_pool()
+    local goal = focused_goal()
+    if not goal then
+      return "error: no focused goal. Create or focus a goal first."
+    end
+    if goal.status == "complete" then
+      return "error: goal is complete. Cannot add tasks."
+    end
+    if not Settings.tasks_enabled() then
+      return "error: tasks are disabled in settings. Enable with /goal-settings."
+    end
+    if not input.tasks or #input.tasks == 0 then
+      return "error: tasks array must not be empty."
+    end
+
+    -- Validate and normalize tasks
+    local normalized = Tasks.normalize_task_list(input.tasks)
+
+    -- Validate subtask depth
+    local max_depth = Settings.max_subtask_depth()
+    local ok, err = Tasks.validate_subtask_depth(normalized, max_depth)
+    if not ok then
+      return "error: " .. err
+    end
+
+    -- Check for duplicate IDs
+    local seen = {}
+    local function check_ids(tasks)
+      for _, t in ipairs(tasks) do
+        if seen[t.id] then
+          return false, "Duplicate task id: " .. t.id
+        end
+        seen[t.id] = true
+        if t.subtasks and #t.subtasks > 0 then
+          local ok2, err2 = check_ids(t.subtasks)
+          if not ok2 then
+            return false, err2
+          end
+        end
+      end
+      return true
+    end
+    ok, err = check_ids(normalized)
+    if not ok then
+      return "error: " .. err
+    end
+
+    -- Save tasks to goal
+    goal.tasks = normalized
+    local ok, err = save_goal(goal)
+    if not ok then
+      return "error: failed to save goal: " .. tostring(err)
+    end
+
+    local total = Tasks.count_tasks(normalized)
+    local tree = Tasks.render_task_tree(normalized)
+    return string.format("Task list applied (%d tasks).\n\n%s", total, tree)
+  end,
+})
+
+maki.api.register_tool({
+  name = "complete_task",
+  description = "Mark a task complete. Does not stop the turn.",
+  schema = {
+    type = "object",
+    required = { "task_id" },
+    properties = {
+      task_id = { type = "string", description = "The task ID to mark complete." },
+      evidence = { type = "string", description = "Evidence of completion (required if task has verification contract)." },
+    },
+  },
+  audiences = { "main" },
+  header = function(input)
+    return "complete task " .. input.task_id
+  end,
+  handler = function(input)
+    refresh_pool()
+    local goal = focused_goal()
+    if not goal then
+      return "error: no focused goal."
+    end
+    if not goal.tasks or #goal.tasks == 0 then
+      return "error: goal has no task list."
+    end
+    if not Settings.tasks_enabled() then
+      return "error: tasks are disabled in settings."
+    end
+
+    local ok, err = Tasks.complete_task(goal.tasks, input.task_id, input.evidence)
+    if not ok then
+      return "error: " .. err
+    end
+
+    local ok, err = save_goal(goal)
+    if not ok then
+      return "error: failed to save goal: " .. tostring(err)
+    end
+
+    local completed = Tasks.count_complete(goal.tasks)
+    local total = Tasks.count_tasks(goal.tasks)
+    return string.format("Task '%s' completed. Progress: %d/%d", input.task_id, completed, total)
+  end,
+})
+
+maki.api.register_tool({
+  name = "skip_task",
+  description = "Mark a task skipped. Does not stop the turn.",
+  schema = {
+    type = "object",
+    required = { "task_id", "reason" },
+    properties = {
+      task_id = { type = "string", description = "The task ID to skip." },
+      reason = { type = "string", description = "Required reason for skipping." },
+    },
+  },
+  audiences = { "main" },
+  header = function(input)
+    return "skip task " .. input.task_id
+  end,
+  handler = function(input)
+    refresh_pool()
+    local goal = focused_goal()
+    if not goal then
+      return "error: no focused goal."
+    end
+    if not goal.tasks or #goal.tasks == 0 then
+      return "error: goal has no task list."
+    end
+    if not Settings.tasks_enabled() then
+      return "error: tasks are disabled in settings."
+    end
+    if not input.reason or input.reason:match("^%s*$") then
+      return "error: reason is required to skip a task."
+    end
+
+    local ok, err = Tasks.skip_task(goal.tasks, input.task_id, input.reason)
+    if not ok then
+      return "error: " .. err
+    end
+
+    local ok, err = save_goal(goal)
+    if not ok then
+      return "error: failed to save goal: " .. tostring(err)
+    end
+
+    return string.format("Task '%s' skipped. Reason: %s", input.task_id, input.reason)
   end,
 })
 
@@ -583,43 +860,67 @@ local function cmd_goal_status()
 end
 
 local function cmd_goal_list()
-  refresh_pool()
-  notify(UI.build_goal_list_text(pool, focused_id))
+   refresh_pool()
+   local open = Store.open_goals(pool)
+   if #open == 0 then
+     notify("No open goals.")
+     return
+   end
+   local items = {}
+   for _, g in ipairs(open) do
+     local marker = g.id == focused_id and "*" or " "
+     local mode = g.sisyphus and "sisyphus" or "goal"
+     items[#items + 1] = {
+       label = marker .. " " .. g.id .. " -- " .. g.status .. " " .. mode,
+       detail = (g.objective or ""):sub(1, 60),
+     }
+   end
+
+    local event = ListPicker.open(items, {
+      title = " Goals ",
+      submit_keys = { "enter" },
+    })
+
+    if event.type == "choice" and event.index >= 1 and event.index <= #open then
+      local g = open[event.index]
+      set_focus(g.id, "selected")
+      notify("Focused goal: " .. g.id)
+    end
 end
 
 local function cmd_goal_focus()
-  refresh_pool()
-  local open = Store.open_goals(pool)
-  if #open == 0 then
-    notify("No open goals.")
-    return
-  end
-  if #open == 1 then
-    set_focus(open[1].id, "selected")
-    notify("Focused goal: " .. open[1].id)
-    return
-  end
+   refresh_pool()
+   local open = Store.open_goals(pool)
+   if #open == 0 then
+     notify("No open goals.")
+     return
+   end
+   if #open == 1 then
+     set_focus(open[1].id, "selected")
+     notify("Focused goal: " .. open[1].id)
+     return
+   end
 
-  local items = {}
-  for _, g in ipairs(open) do
-    local marker = g.id == focused_id and "*" or " "
-    local mode = g.sisyphus and "sisyphus" or "goal"
-    items[#items + 1] = {
-      label = marker .. " " .. g.id .. " -- " .. g.status .. " " .. mode,
-      detail = (g.objective or ""):sub(1, 60),
-    }
-  end
+   local items = {}
+   for _, g in ipairs(open) do
+     local marker = g.id == focused_id and "*" or " "
+     local mode = g.sisyphus and "sisyphus" or "goal"
+     items[#items + 1] = {
+       label = marker .. " " .. g.id .. " -- " .. g.status .. " " .. mode,
+       detail = (g.objective or ""):sub(1, 60),
+     }
+   end
 
-  local event = ListPicker.open(items, {
-    title = " Focus Goal ",
-    submit_keys = { "enter" },
-  })
+   local event = ListPicker.open(items, {
+     title = " Focus Goal ",
+     submit_keys = { "enter" },
+   })
 
-  if event.type == "choice" and event.index >= 1 and event.index <= #open then
-    local g = open[event.index]
-    set_focus(g.id, "selected")
-    notify("Focused goal: " .. g.id)
-  end
+   if event.type == "choice" and event.index >= 1 and event.index <= #open then
+     local g = open[event.index]
+     set_focus(g.id, "selected")
+     notify("Focused goal: " .. g.id)
+   end
 end
 
 local function cmd_goal_pause()
@@ -711,6 +1012,8 @@ local function cmd_goal_tweak(args)
     return
   end
   tweak_state = { goal_id = goal.id, hint = args, started_at = os.time() }
+  goal.tweak_state = "active"
+  save_goal(goal)
   notify("Goal tweak drafting started" .. (args and (": " .. args) or "."))
 end
 
@@ -786,6 +1089,28 @@ maki.api.register_command({
   handler = cmd_goal_tweak,
 })
 
+maki.api.register_command({
+  name = "/goal-tasks",
+  description = "Show task list for focused goal",
+  handler = function()
+    refresh_pool()
+    local goal = focused_goal()
+    if not goal then
+      notify("No goal is set.")
+      return
+    end
+    if not goal.tasks or Tasks.count_tasks(goal.tasks) == 0 then
+      notify("No tasks for this goal. Use propose_task_list to create one.")
+      return
+    end
+    local total = Tasks.count_tasks(goal.tasks)
+    local completed = Tasks.count_complete(goal.tasks)
+    local pending = Tasks.count_pending(goal.tasks)
+    local tree = Tasks.render_task_tree(goal.tasks)
+    notify(string.format("Tasks: %d/%d complete (%d pending)\n\n%s", completed, total, pending, tree))
+  end,
+})
+
 local function toggle_goal_list()
   refresh_pool()
   local open = Store.open_goals(pool)
@@ -806,31 +1131,49 @@ local function toggle_goal_list()
   local event = ListPicker.open(items, {
     title = " Goals ",
     submit_keys = { "enter" },
-    footer = {
-      { "Enter", "focus" },
-      { "Ctrl+O", "details" },
-    },
   })
 
   if event.type == "choice" and event.index >= 1 and event.index <= #open then
     local g = open[event.index]
-    if event.key == "ctrl+o" then
-      notify(UI.build_goal_detail(g))
-    else
-      set_focus(g.id, "selected")
-      notify("Focused goal: " .. g.id)
-    end
+    set_focus(g.id, "selected")
+    notify("Focused goal: " .. g.id)
   end
 end
 
 maki.keymap.set("n", "<C-g>", toggle_goal_list, { desc = "Toggle goal list" })
+maki.keymap.set("n", "<C-S-g>", function()
+  refresh_pool()
+  local goal = focused_goal()
+  if not goal then
+    notify("No goal is set.")
+    return
+  end
+  if not goal.tasks or Tasks.count_tasks(goal.tasks) == 0 then
+    notify("No tasks for this goal.")
+    return
+  end
+  local total = Tasks.count_tasks(goal.tasks)
+  local completed = Tasks.count_complete(goal.tasks)
+  local pending = Tasks.count_pending(goal.tasks)
+  local tree = Tasks.render_task_tree(goal.tasks)
+  notify(string.format("Tasks: %d/%d complete (%d pending)\n\n%s", completed, total, pending, tree))
+end, { desc = "Show task list" })
 
 maki.api.create_autocmd("TurnEnd", {
   callback = function()
     refresh_pool()
     local goal = focused_goal()
     if goal then
-      UI.status_hint(goal)
+      -- Process deferred archival (e.g. after complete action)
+      if goal._deferred_archive then
+        local ok, result = Auditor.process_deferred_archive(goal, pool)
+        if ok then
+          set_focus(nil, "completed")
+          UI.clear_status_hint()
+        end
+      else
+        UI.status_hint(goal)
+      end
     else
       UI.clear_status_hint()
     end

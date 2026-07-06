@@ -1,5 +1,9 @@
 local M = {}
 
+local Tasks = require("goal_tasks")
+local Contracts = require("goal_contracts")
+local Settings = require("goal_settings")
+
 local STATUS_MARKERS = {
   active = { "[active]", "todo_in_progress" },
   paused = { "[paused]", "todo_pending" },
@@ -21,9 +25,13 @@ function M.status_hint(goal)
   end
   local marker = STATUS_MARKERS[goal.status] or STATUS_MARKERS.active
   local obj = truncate(goal.objective or "", 50)
-  maki.ui.set_status_hint({
-    { marker[1] .. " " .. obj, marker[2] },
-  })
+  local hint_parts = { { marker[1] .. " " .. obj, marker[2] } }
+  if goal.tasks and Tasks.count_tasks(goal.tasks) > 0 then
+    local completed = Tasks.count_complete(goal.tasks)
+    local total = Tasks.count_tasks(goal.tasks)
+    hint_parts[#hint_parts + 1] = { " (" .. completed .. "/" .. total .. " tasks)" }
+  end
+  maki.ui.set_status_hint(hint_parts)
 end
 
 function M.clear_status_hint()
@@ -77,6 +85,18 @@ function M.build_goal_detail(goal)
   if goal.stop_reason then
     lines[#lines + 1] = "Stop reason: " .. goal.stop_reason
   end
+  if Contracts.has_contract(goal) then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Verification contract:"
+    lines[#lines + 1] = goal.verification_contract
+  end
+  if goal.tasks and Tasks.count_tasks(goal.tasks) > 0 then
+    lines[#lines + 1] = ""
+    local completed = Tasks.count_complete(goal.tasks)
+    local total = Tasks.count_tasks(goal.tasks)
+    lines[#lines + 1] = "Tasks: " .. completed .. "/" .. total .. " complete"
+    lines[#lines + 1] = Tasks.render_task_tree(goal.tasks)
+  end
   return table.concat(lines, "\n")
 end
 
@@ -95,6 +115,15 @@ function M.build_completion_report(goal, summary, auditor_report)
     lines[#lines + 1] = "Completion summary:"
     lines[#lines + 1] = summary
   end
+  if Contracts.has_contract(goal) and goal.verification_summary then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Verification summary:"
+    lines[#lines + 1] = goal.verification_summary
+  end
+  if goal.tasks and Tasks.count_tasks(goal.tasks) > 0 then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = M.build_task_list_text(goal)
+  end
   lines[#lines + 1] = ""
   lines[#lines + 1] = M.build_goal_detail(goal)
   return table.concat(lines, "\n")
@@ -108,6 +137,50 @@ function M.build_goal_created_report(goal)
     "",
     goal.objective or "",
   }
+  if Contracts.has_contract(goal) then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Verification contract:"
+    lines[#lines + 1] = goal.verification_contract
+  end
+  if goal.tasks and Tasks.count_tasks(goal.tasks) > 0 then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = M.build_task_list_text(goal)
+  end
+  return table.concat(lines, "\n")
+end
+
+function M.build_task_list_text(goal)
+  if not goal or not goal.tasks then
+    return ""
+  end
+  local total = Tasks.count_tasks(goal.tasks)
+  if total == 0 then
+    return ""
+  end
+  local completed = Tasks.count_complete(goal.tasks)
+  local lines = {
+    "Tasks: " .. completed .. "/" .. total .. " complete",
+    Tasks.render_task_tree(goal.tasks),
+  }
+  return table.concat(lines, "\n")
+end
+
+function M.build_proposal_text(goal, tasks)
+  local lines = {
+    "Proposed goal:",
+    "",
+    goal.objective or "",
+  }
+  if Contracts.has_contract(goal) then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Verification contract:"
+    lines[#lines + 1] = goal.verification_contract
+  end
+  if tasks and Tasks.count_tasks(tasks) > 0 then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Tasks:"
+    lines[#lines + 1] = Tasks.render_task_tree(tasks)
+  end
   return table.concat(lines, "\n")
 end
 
